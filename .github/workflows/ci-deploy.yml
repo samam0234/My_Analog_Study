@@ -1,0 +1,94 @@
+name: Verify and deploy
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lesson
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: lesson/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+  image:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      reference: ${{ steps.publish.outputs.reference }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Publish tested commit as an immutable image
+        id: publish
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          package="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tag="$package:$GITHUB_SHA"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build -t "$tag" lesson
+          docker push "$tag"
+          reference=$(docker image inspect --format '{{index .RepoDigests 0}}' "$tag")
+          echo "reference=$reference" >> "$GITHUB_OUTPUT"
+  deploy:
+    if: github.ref == 'refs/heads/main' && vars.BOARD_DEPLOY == 'true'
+    needs: image
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency: { group: analog-board-production, cancel-in-progress: false }
+    steps:
+      - name: Pull image and check readiness over SSH
+        env:
+          BOARD_IMAGE: ${{ needs.image.outputs.reference }}
+          SSH_HOST: ${{ secrets.BOARD_SSH_HOST }}
+          SSH_USER: ${{ secrets.BOARD_SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.BOARD_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.BOARD_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$BOARD_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$ ]]
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/board
+          chmod 600 ~/.ssh/board
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i ~/.ssh/board -- "$SSH_USER@$SSH_HOST" "BOARD_IMAGE='$BOARD_IMAGE' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/analog-board/lesson
+          previous=$(docker compose ps -q board)
+          previous_image=""
+          if [ -n "$previous" ]; then previous_image=$(docker inspect --format '{{.Config.Image}}' "$previous"); fi
+          docker compose pull board
+          docker compose up -d --no-build board
+          if ! docker compose exec -T board node -e '
+            (async () => {
+              for (let attempt = 0; attempt < 30; attempt++) {
+                const result = await fetch("http://127.0.0.1:3000/api/ready").catch(() => null);
+                if (result?.ok) return;
+                await new Promise(resolve => setTimeout(resolve, 2000));
+              }
+              process.exitCode = 1;
+            })();
+          '; then
+            if [ -n "$previous_image" ]; then BOARD_IMAGE="$previous_image" docker compose up -d --no-build board; fi
+            exit 1
+          fi
+          REMOTE

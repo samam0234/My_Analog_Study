@@ -1,0 +1,68 @@
+services:
+  board:
+    image: ${BOARD_IMAGE:-analog-board:local}
+    build: .
+    ports: ["127.0.0.1:${BOARD_PORT:-3000}:3000"]
+    environment:
+      APP_SECRET: ${APP_SECRET:?set APP_SECRET in .env}
+      APP_ORIGIN: ${APP_ORIGIN:?set APP_ORIGIN in .env}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      DB_CLIENT: pg
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      REDIS_URL: redis://redis:6379
+      SMTP_URL: ${SMTP_URL:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PRICE_ID: ${STRIPE_PRICE_ID:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      AI_PROVIDER: ${AI_PROVIDER:-demo}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_DAILY_REQUEST_LIMIT: ${AI_DAILY_REQUEST_LIMIT:-20}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+    volumes: ["uploads:/app/data"]
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_started }
+    logging:
+      options: { max-size: "10m", max-file: "3" }
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: board
+      POSTGRES_USER: board
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes: ["db:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U board -d board"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redis:/data"]
+    restart: unless-stopped
+  mailpit:
+    image: axllent/mailpit:v1.27
+    profiles: ["mail-test"]
+    ports: ["127.0.0.1:8025:8025"]
+  proxy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    environment:
+      BOARD_DOMAIN: ${BOARD_DOMAIN:-localhost}
+    ports: ["80:80", "443:443"]
+    volumes: ["./Caddyfile:/etc/caddy/Caddyfile:ro", "caddy:/data"]
+    depends_on: ["board"]
+    restart: unless-stopped
+volumes:
+  db:
+  redis:
+  uploads:
+  caddy:
